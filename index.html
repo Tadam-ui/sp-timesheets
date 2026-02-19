@@ -1,0 +1,313 @@
+<script>
+
+/* ================================
+   GOOGLE SHEETS WEB APP URL
+================================ */
+
+const GOOGLE_SCRIPT_URL =
+'https://script.google.com/macros/s/AKfycbxvRWVHRf_diTDdZ8qp_RPXj4n97SZNb5ePPuALqdBWgH0L1KOxN3UzoYif2Ly5eiOy-Q/exec';
+
+
+/* ================================
+   EMPLOYEES
+================================ */
+
+const EMPLOYEES = {
+    '1234': { id: 1, name: 'Dan Halpin' },
+    '5678': { id: 2, name: 'Paul Read' },
+    '9012': { id: 3, name: 'Devris Hudaverdi' },
+    '3456': { id: 4, name: 'Shane Clark' },
+    '7890': { id: 5, name: 'Jack Saillart' },
+    '2468': { id: 6, name: 'John Tomlin' }
+};
+
+const ADMIN_PASSWORD = 'admin2025';
+
+
+/* ================================
+   APP CLASS
+================================ */
+
+class TimesheetApp {
+
+    constructor() {
+        this.currentUser = null;
+        this.currentEntry = null;
+        this.timerInterval = null;
+        this.db = null;
+        this.initDB();
+    }
+
+    async initDB() {
+        return new Promise((resolve) => {
+            const request = indexedDB.open('SPTimesheets', 3);
+
+            request.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains('entries')) {
+                    const store = db.createObjectStore('entries', { keyPath: 'id', autoIncrement: true });
+                    store.createIndex('employeeId', 'employeeId');
+                    store.createIndex('date', 'date');
+                }
+            };
+
+            request.onsuccess = (e) => {
+                this.db = e.target.result;
+                resolve();
+            };
+        });
+    }
+
+
+    /* LOGIN */
+
+    login() {
+        const phone = document.getElementById('phoneInput').value;
+        const user = EMPLOYEES[phone];
+
+        if (!user) {
+            alert('Phone number not recognized.');
+            return;
+        }
+
+        this.currentUser = user;
+        localStorage.setItem('currentUser', JSON.stringify(user));
+        this.showMainApp();
+    }
+
+    logout() {
+        localStorage.removeItem('currentUser');
+        location.reload();
+    }
+
+    async showMainApp() {
+        document.getElementById('loginScreen').classList.add('hidden');
+        document.getElementById('mainApp').classList.remove('hidden');
+        document.getElementById('userName').textContent = this.currentUser.name;
+
+        await this.loadTodayEntry();
+        this.updateClockUI();
+    }
+
+
+    /* CLOCK */
+
+    async toggleClock() {
+        if (this.currentEntry && this.currentEntry.clockIn && !this.currentEntry.clockOut) {
+            await this.clockOut();
+        } else {
+            await this.clockIn();
+        }
+    }
+
+    async clockIn() {
+
+        const now = new Date().toISOString();
+
+        const entry = {
+            employeeId: this.currentUser.id,
+            employeeName: this.currentUser.name,
+            date: now.split('T')[0],
+            clockIn: now,
+            clockOut: null,
+            notes: '',
+            shiftType: 'Regular'
+        };
+
+        const id = await this.addEntry(entry);
+        this.currentEntry = { ...entry, id };
+
+        this.updateClockUI();
+        this.startTimer();
+        this.showAlert('Clocked in successfully!');
+    }
+
+    async clockOut() {
+
+        if (!this.currentEntry) return;
+
+        const notes = prompt('Add any notes (bonus, details etc.)') || '';
+        const now = new Date().toISOString();
+
+        await this.updateEntry(this.currentEntry.id, {
+            clockOut: now,
+            notes: notes
+        });
+
+        if (this.timerInterval) clearInterval(this.timerInterval);
+
+        const completedEntry = {
+            ...this.currentEntry,
+            clockOut: now,
+            notes: notes
+        };
+
+        await this.uploadToGoogleSheets(completedEntry);
+
+        await this.loadTodayEntry();
+        this.updateClockUI();
+        this.showAlert('Clocked out successfully!');
+    }
+
+
+    /* GOOGLE UPLOAD */
+
+    async uploadToGoogleSheets(entry) {
+
+        const hours = this.calculateHours(entry.clockIn, entry.clockOut);
+
+        const payload = {
+            engineer: entry.employeeName,
+            date: entry.date,
+            start: this.formatTime(entry.clockIn),
+            end: this.formatTime(entry.clockOut),
+            hours: hours.toFixed(2),
+            job: entry.shiftType || 'Regular',
+            notes: entry.notes || ''
+        };
+
+        try {
+            await fetch(GOOGLE_SCRIPT_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+        } catch (error) {
+            console.error('Google upload failed:', error);
+        }
+    }
+
+
+    /* TIMER */
+
+    startTimer() {
+        if (this.timerInterval) clearInterval(this.timerInterval);
+
+        this.timerInterval = setInterval(() => {
+            if (this.currentEntry && this.currentEntry.clockIn && !this.currentEntry.clockOut) {
+                const hours = this.calculateHours(this.currentEntry.clockIn, new Date().toISOString());
+                document.getElementById('todayHours').textContent =
+                    this.formatHoursMinutes(hours);
+            }
+        }, 1000);
+    }
+
+    updateClockUI() {
+        const btn = document.getElementById('clockBtn');
+        const btnText = document.getElementById('clockBtnText');
+
+        if (this.currentEntry && this.currentEntry.clockIn && !this.currentEntry.clockOut) {
+            btn.className = 'clock-button clock-out-btn';
+            btnText.textContent = 'Clock out';
+        } else {
+            btn.className = 'clock-button clock-in-btn';
+            btnText.textContent = 'Clock in';
+        }
+    }
+
+    async loadTodayEntry() {
+        const today = new Date().toISOString().split('T')[0];
+        const entries = await this.getEntries(this.currentUser.id, today, today);
+
+        this.currentEntry =
+            entries.find(e => !e.clockOut) ||
+            entries[entries.length - 1] ||
+            null;
+
+        if (this.currentEntry && this.currentEntry.clockIn && this.currentEntry.clockOut) {
+            const hours = this.calculateHours(
+                this.currentEntry.clockIn,
+                this.currentEntry.clockOut
+            );
+            document.getElementById('todayHours').textContent =
+                this.formatHoursMinutes(hours);
+        } else {
+            document.getElementById('todayHours').textContent = '0:00';
+        }
+    }
+
+
+    /* DATABASE */
+
+    async addEntry(entry) {
+        return new Promise((resolve) => {
+            const tx = this.db.transaction(['entries'], 'readwrite');
+            const req = tx.objectStore('entries').add(entry);
+            req.onsuccess = () => resolve(req.result);
+        });
+    }
+
+    async updateEntry(id, updates) {
+        return new Promise((resolve) => {
+            const tx = this.db.transaction(['entries'], 'readwrite');
+            const store = tx.objectStore('entries');
+            const getReq = store.get(id);
+
+            getReq.onsuccess = () => {
+                const entry = getReq.result;
+                Object.assign(entry, updates);
+                store.put(entry);
+                resolve();
+            };
+        });
+    }
+
+    async getEntries(employeeId = null, startDate = null, endDate = null) {
+        return new Promise((resolve) => {
+            const tx = this.db.transaction(['entries'], 'readonly');
+            const request = tx.objectStore('entries').getAll();
+            request.onsuccess = () => {
+                let entries = request.result;
+
+                if (employeeId)
+                    entries = entries.filter(e => e.employeeId === employeeId);
+
+                if (startDate && endDate)
+                    entries = entries.filter(e => e.date >= startDate && e.date <= endDate);
+
+                resolve(entries);
+            };
+        });
+    }
+
+
+    /* UTILITIES */
+
+    calculateHours(start, end) {
+        return (new Date(end) - new Date(start)) / 36e5;
+    }
+
+    formatHoursMinutes(hours) {
+        const h = Math.floor(hours);
+        const m = Math.round((hours - h) * 60);
+        return `${h}:${m.toString().padStart(2, '0')}`;
+    }
+
+    formatTime(iso) {
+        return new Date(iso).toLocaleTimeString('en-GB', {
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    }
+
+    showAlert(message) {
+        const alert = document.createElement('div');
+        alert.className = 'alert';
+        alert.textContent = message;
+        document.body.appendChild(alert);
+        setTimeout(() => alert.remove(), 3000);
+    }
+}
+
+
+/* INIT */
+
+const app = new TimesheetApp();
+
+const savedUser = localStorage.getItem('currentUser');
+if (savedUser) {
+    app.currentUser = JSON.parse(savedUser);
+    app.showMainApp();
+}
+
+</script>
